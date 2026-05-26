@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -850,7 +851,7 @@ body[data-nav="hidden"] .topbar-menu-btn { display: inline-flex; }
 <!-- Firebase SDK (modular, compat-less) -->
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
-  import { getFirestore, doc, getDoc, setDoc, onSnapshot, serverTimestamp }
+  import { getFirestore, doc, getDoc, setDoc, deleteDoc, onSnapshot, serverTimestamp }
     from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -867,7 +868,7 @@ body[data-nav="hidden"] .topbar-menu-btn { display: inline-flex; }
   const db = getFirestore(app);
 
   // Expose to non-module code below
-  window.__fb = { db, doc, getDoc, setDoc, onSnapshot, serverTimestamp };
+  window.__fb = { db, doc, getDoc, setDoc, deleteDoc, onSnapshot, serverTimestamp };
   window.dispatchEvent(new Event('firebase-ready'));
 </script>
 
@@ -1209,7 +1210,47 @@ const cloudSync = (function() {
     isReady: () => initialized,
   };
 })();
+/* ============ PHOTO STORE (separate Firestore docs per photo) ============ */
+const photoStore = (function() {
+  const WORKSPACE = 'shared';
+  const cache = {}; // photoId -> dataUrl (in-memory cache for current session)
 
+  async function savePhoto(photoId, dataUrl) {
+    if (!window.__fb) throw new Error('Firebase not ready');
+    const { db, doc, setDoc } = window.__fb;
+    await setDoc(doc(db, 'workspaces', WORKSPACE, 'photos', photoId), {
+      data: dataUrl,
+      createdAt: Date.now(),
+    });
+    cache[photoId] = dataUrl;
+  }
+
+  async function loadPhoto(photoId) {
+    if (cache[photoId]) return cache[photoId];
+    if (!window.__fb) return null;
+    const { db, doc, getDoc } = window.__fb;
+    const snap = await getDoc(doc(db, 'workspaces', WORKSPACE, 'photos', photoId));
+    if (!snap.exists()) return null;
+    const data = snap.data().data;
+    cache[photoId] = data;
+    return data;
+  }
+
+  async function deletePhoto(photoId) {
+    if (!window.__fb) return;
+    const { db, doc, deleteDoc } = window.__fb;
+    if (deleteDoc) {
+      await deleteDoc(doc(db, 'workspaces', WORKSPACE, 'photos', photoId));
+    }
+    delete cache[photoId];
+  }
+
+  function getCached(photoId) {
+    return cache[photoId] || null;
+  }
+
+  return { savePhoto, loadPhoto, deletePhoto, getCached };
+})();
 // Trigger save when any tracked state slice changes.
 // Anything that mutates state.* should call cloudSync.scheduleSave('fields') etc.
 // To make that automatic, we wrap the top-level state with a Proxy.
@@ -3727,15 +3768,26 @@ function section(title, color, body) {
 function handlePhotoUpload(e) {
   const files = Array.from(e.target.files);
   files.forEach(file => {
-    compressImage(file, 1600, 0.75).then(dataUrl => {
-      state.currentReport.photos.push({ id: uid('p'), data: dataUrl, caption: '', name: file.name });
+    compressImage(file, 1600, 0.75).then(async dataUrl => {
+      const photoId = uid('p');
+      // Push placeholder immediately so UI shows it
+      state.currentReport.photos.push({ id: photoId, data: dataUrl, caption: '', name: file.name, uploading: true });
       renderPhotoGrid();
+      try {
+        await photoStore.savePhoto(photoId, dataUrl);
+        const ph = state.currentReport.photos.find(p => p.id === photoId);
+        if (ph) { ph.uploading = false; renderPhotoGrid(); }
+      } catch (err) {
+        console.error('Photo upload failed:', err);
+        toast('Photo upload failed: ' + (file.name || 'unknown'));
+        const idx = state.currentReport.photos.findIndex(p => p.id === photoId);
+        if (idx >= 0) { state.currentReport.photos.splice(idx, 1); renderPhotoGrid(); }
+      }
     }).catch(err => {
       console.error('Photo compression failed:', err);
       toast('Could not process photo: ' + (file.name || 'unknown'));
     });
   });
-  // Clear the input so the same file can be re-picked if needed
   e.target.value = '';
 }
 
@@ -3758,7 +3810,14 @@ function compressImage(file, maxDim, quality) {
         canvas.height = height;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', quality));
+        // Try progressively lower quality until under 500KB base64
+        let q = quality;
+        let dataUrl = canvas.toDataURL('image/jpeg', q);
+        while (dataUrl.length > 500000 && q > 0.3) {
+          q -= 0.1;
+          dataUrl = canvas.toDataURL('image/jpeg', q);
+        }
+        resolve(dataUrl);
       };
       img.onerror = reject;
       img.src = ev.target.result;
@@ -3801,7 +3860,7 @@ function saveReport() {
     nutrient: { deficiency: get('rNutDef'), compaction: get('rNutComp'), moisture: get('rNutMoist'), envStress: get('rNutEnv') },
     conditions: { ponding: get('rCondPond'), erosion: get('rCondEros'), storm: get('rCondStorm'), tile: get('rCondTile') },
     recs: { product: get('rRecProd'), timing: get('rRecTiming'), rescout: get('rRecRescout'), priority: priority, action: get('rRecAction') },
-    photos: state.currentReport.photos.slice(),
+    photos: state.currentReport.photos.map(p => ({ id: p.id, caption: p.caption, name: p.name })),
     healthScore: parseInt(get('rHealth')) || 80,
   };
   state.reports.push(report);
@@ -3817,6 +3876,24 @@ function saveReport() {
 function openReportView(rid) {
   const r = state.reports.find(x => x.id === rid);
   if (!r) return;
+  // Hydrate photo data from photo store if missing (one-time, no loop)
+  if (r.photos && r.photos.length > 0 && !r._photosHydrated) {
+    r._photosHydrated = true;
+    let needsRehydrate = false;
+    Promise.all(r.photos.map(async p => {
+      if (!p.data) {
+        needsRehydrate = true;
+        const data = photoStore.getCached(p.id) || await photoStore.loadPhoto(p.id);
+        if (data) p.data = data;
+      }
+    })).then(() => {
+      // Only re-render if we actually loaded something new and modal is still open
+      if (needsRehydrate) {
+        const modal = document.getElementById('modal');
+        if (modal && modal.classList.contains('show')) openReportView(rid);
+      }
+    });
+  }
   const f = state.fields.find(x => x.id === r.fieldId);
   const health = r.healthScore || 75;
   const healthColor = health >= 80 ? '#3a7a3a' : health >= 60 ? '#d68910' : '#c0392b';
@@ -3917,7 +3994,7 @@ function openReportView(rid) {
           <div class="report-section">
             <div class="report-section-title">Photos (${r.photos.length})</div>
             <div class="report-photos">
-              ${r.photos.map(p => `<div class="report-photo"><img src="${p.data}" alt=""/>${p.caption ? `<div class="rp-caption">${esc(p.caption)}</div>` : ''}</div>`).join('')}
+              ${r.photos.map(p => `<div class="report-photo"><img src="${p.data || ''}" alt=""/>${p.caption ? `<div class="rp-caption">${esc(p.caption)}</div>` : ''}</div>`).join('')}
             </div>
           </div>
         ` : ''}
