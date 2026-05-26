@@ -853,6 +853,8 @@ body[data-nav="hidden"] .topbar-menu-btn { display: inline-flex; }
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
   import { getFirestore, doc, getDoc, setDoc, deleteDoc, onSnapshot, serverTimestamp }
     from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+  import { getStorage, ref as storageRef, uploadString, getDownloadURL, deleteObject }
+    from "https://www.gstatic.com/firebasejs/10.13.0/firebase-storage.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyBNnZMZ12_1XuwhBZKvhRvnsIBsT3Jw3V0",
@@ -866,9 +868,11 @@ body[data-nav="hidden"] .topbar-menu-btn { display: inline-flex; }
 
   const app = initializeApp(firebaseConfig);
   const db = getFirestore(app);
+  const storage = getStorage(app);
 
   // Expose to non-module code below
-  window.__fb = { db, doc, getDoc, setDoc, deleteDoc, onSnapshot, serverTimestamp };
+  window.__fb = { db, doc, getDoc, setDoc, deleteDoc, onSnapshot, serverTimestamp,
+                  storage, storageRef, uploadString, getDownloadURL, deleteObject };
   window.dispatchEvent(new Event('firebase-ready'));
 </script>
 
@@ -1063,6 +1067,23 @@ const cloudSync = (function() {
   function packShard(shardName) {
     const out = {};
     SHARDS[shardName].forEach(k => { out[k] = state[k]; });
+    // Defensive cleanup: never let base64 data URLs into the reports shard.
+    // Photos belong in Firebase Storage. p.data should be an https:// URL.
+    if (shardName === 'reports' && Array.isArray(out.reports)) {
+      out.reports = out.reports.map(r => {
+        if (!r || !Array.isArray(r.photos)) return r;
+        const cleanPhotos = r.photos.map(p => {
+          const cleanP = { id: p.id, caption: p.caption, name: p.name };
+          // Only keep p.data if it's a real URL, not base64
+          if (typeof p.data === 'string' && p.data.startsWith('http')) {
+            cleanP.data = p.data;
+          }
+          return cleanP;
+        });
+        // Return a shallow copy with cleaned photos; never mutate state
+        return { ...r, photos: cleanPhotos, _photosHydrated: undefined };
+      });
+    }
     return out;
   }
 
@@ -1210,37 +1231,60 @@ const cloudSync = (function() {
     isReady: () => initialized,
   };
 })();
-/* ============ PHOTO STORE (separate Firestore docs per photo) ============ */
+/* ============ PHOTO STORE (Firebase Storage backed) ============
+   Photos live in Firebase Storage, not Firestore. The report only stores
+   the photoId + downloadURL (small string) — no base64. This keeps the
+   reports shard tiny and lets us scale to thousands of photos.
+*/
 const photoStore = (function() {
   const WORKSPACE = 'shared';
-  const cache = {}; // photoId -> dataUrl (in-memory cache for current session)
+  const cache = {}; // photoId -> downloadURL (in-memory cache for current session)
 
-  async function savePhoto(photoId, dataUrl) {
-    if (!window.__fb) throw new Error('Firebase not ready');
-    const { db, doc, setDoc } = window.__fb;
-    await setDoc(doc(db, 'workspaces', WORKSPACE, 'photos', photoId), {
-      data: dataUrl,
-      createdAt: Date.now(),
-    });
-    cache[photoId] = dataUrl;
+  function photoPath(photoId) {
+    return `workspaces/${WORKSPACE}/photos/${photoId}.jpg`;
   }
 
+  // Upload a base64 data URL (e.g. "data:image/jpeg;base64,...") to Storage
+  // and return the public download URL.
+  async function savePhoto(photoId, dataUrl) {
+    if (!window.__fb) throw new Error('Firebase not ready');
+    const { storage, storageRef, uploadString, getDownloadURL } = window.__fb;
+    const ref = storageRef(storage, photoPath(photoId));
+    // 'data_url' format strips the data: prefix automatically
+    await uploadString(ref, dataUrl, 'data_url');
+    const url = await getDownloadURL(ref);
+    cache[photoId] = url;
+    return url;
+  }
+
+  // Returns the download URL for a photo. If we have it cached, use cache;
+  // otherwise look it up from Storage. Falls back to null if Storage isn't ready.
   async function loadPhoto(photoId) {
     if (cache[photoId]) return cache[photoId];
     if (!window.__fb) return null;
-    const { db, doc, getDoc } = window.__fb;
-    const snap = await getDoc(doc(db, 'workspaces', WORKSPACE, 'photos', photoId));
-    if (!snap.exists()) return null;
-    const data = snap.data().data;
-    cache[photoId] = data;
-    return data;
+    const { storage, storageRef, getDownloadURL } = window.__fb;
+    try {
+      const ref = storageRef(storage, photoPath(photoId));
+      const url = await getDownloadURL(ref);
+      cache[photoId] = url;
+      return url;
+    } catch (err) {
+      console.warn('Photo not found in Storage:', photoId, err.code);
+      return null;
+    }
   }
 
   async function deletePhoto(photoId) {
     if (!window.__fb) return;
-    const { db, doc, deleteDoc } = window.__fb;
-    if (deleteDoc) {
-      await deleteDoc(doc(db, 'workspaces', WORKSPACE, 'photos', photoId));
+    const { storage, storageRef, deleteObject } = window.__fb;
+    try {
+      const ref = storageRef(storage, photoPath(photoId));
+      await deleteObject(ref);
+    } catch (err) {
+      // 'object-not-found' is fine — already gone
+      if (err.code !== 'storage/object-not-found') {
+        console.warn('Photo delete failed:', photoId, err.code);
+      }
     }
     delete cache[photoId];
   }
@@ -1249,8 +1293,57 @@ const photoStore = (function() {
     return cache[photoId] || null;
   }
 
-  return { savePhoto, loadPhoto, deletePhoto, getCached };
+  // Seed the cache directly (used during migration when we already have the URL)
+  function setCached(photoId, url) {
+    cache[photoId] = url;
+  }
+
+  return { savePhoto, loadPhoto, deletePhoto, getCached, setCached };
 })();
+
+/* ============ ONE-TIME PHOTO MIGRATION ============
+   Walks every report. For each photo lacking a Storage URL (p.data is base64
+   or missing), pulls the base64 from the legacy per-photo Firestore docs,
+   uploads to Storage, swaps p.data for the new URL. After it runs, the next
+   render() will save reports back to Firestore — tiny and clean.
+
+   Run from the browser console:    migratePhotosToStorage()
+   Safe to re-run. Reports already migrated are skipped automatically.
+*/
+window.migratePhotosToStorage = async function() {
+  if (!window.__fb) { console.error('Firebase not ready'); return; }
+  const { db, doc, getDoc } = window.__fb;
+  const WORKSPACE = 'shared';
+  let migrated = 0, skipped = 0, failed = 0;
+  console.log('Starting photo migration. Total reports:', state.reports.length);
+  for (const r of state.reports) {
+    if (!Array.isArray(r.photos) || r.photos.length === 0) continue;
+    for (const p of r.photos) {
+      if (!p || !p.id) continue;
+      // Already migrated? Skip.
+      if (typeof p.data === 'string' && p.data.startsWith('http')) { skipped++; continue; }
+      try {
+        // Try to read base64 from p.data first, then from legacy Firestore doc
+        let base64 = (typeof p.data === 'string' && p.data.startsWith('data:')) ? p.data : null;
+        if (!base64) {
+          const snap = await getDoc(doc(db, 'workspaces', WORKSPACE, 'photos', p.id));
+          if (snap.exists()) base64 = snap.data().data;
+        }
+        if (!base64) { console.warn('No base64 found for photo', p.id); failed++; continue; }
+        const url = await photoStore.savePhoto(p.id, base64);
+        p.data = url;
+        migrated++;
+        if (migrated % 5 === 0) console.log(`Progress: ${migrated} photos migrated`);
+      } catch (err) {
+        console.error('Migration failed for photo', p.id, err);
+        failed++;
+      }
+    }
+  }
+  console.log(`Migration done. Migrated: ${migrated}, already-migrated: ${skipped}, failed: ${failed}`);
+  console.log('Triggering save to push cleaned reports back to Firestore…');
+  cloudSync.forceSave();
+};
 // Trigger save when any tracked state slice changes.
 // Anything that mutates state.* should call cloudSync.scheduleSave('fields') etc.
 // To make that automatic, we wrap the top-level state with a Proxy.
@@ -2640,7 +2733,9 @@ function reportRow(r) {
           <span class="report-health-val">${health}/100</span>
         </div>
       </div>
-      <button class="report-row-delete" onclick="event.stopPropagation(); deleteReport('${esc(r.id)}')" title="Delete report">
+      <button class="report-row-delete" onclick="event.stopPropagation(); openNewReport(null, '${esc(r.id)}')" title="Edit report">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+      </button><button class="report-row-delete" onclick="event.stopPropagation(); deleteReport('${esc(r.id)}')" title="Delete report">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg>
       </button>
     </div>
@@ -2727,6 +2822,10 @@ function deleteReport(rid) {
   const r = state.reports.find(x => x.id === rid);
   if (!r) return;
   if (!confirm(`Delete this report from ${r.fieldName || 'this field'} dated ${r.date || 'unknown'}?`)) return;
+  // Clean up photos from Storage (fire and forget — failures are logged, not fatal)
+  if (Array.isArray(r.photos)) {
+    r.photos.forEach(p => { if (p && p.id) photoStore.deletePhoto(p.id); });
+  }
   state.reports = state.reports.filter(x => x.id !== rid);
   state.selectedReportIds = (state.selectedReportIds || []).filter(id => id !== rid);
   const bd = document.getElementById('modalBackdrop');
@@ -2739,6 +2838,12 @@ function deleteSelectedReports() {
   const ids = state.selectedReportIds || [];
   if (ids.length === 0) { toast('No reports selected'); return; }
   if (!confirm(`Delete ${ids.length} selected report${ids.length === 1 ? '' : 's'}? This cannot be undone.`)) return;
+  // Clean up photos from Storage for every report being deleted
+  state.reports.filter(r => ids.includes(r.id)).forEach(r => {
+    if (Array.isArray(r.photos)) {
+      r.photos.forEach(p => { if (p && p.id) photoStore.deletePhoto(p.id); });
+    }
+  });
   state.reports = state.reports.filter(r => !ids.includes(r.id));
   state.selectedReportIds = [];
   toast(`Deleted ${ids.length} report${ids.length === 1 ? '' : 's'}`);
@@ -3654,12 +3759,19 @@ function getAISuggestion(f, dap) {
   return `Late-season / R5–R6 (${dap} DAP). Stalk push tests recommended. Plan harvest order by lodging risk and dry-down.`;
 }
 
-function openNewReport(fid) {
+function openNewReport(fid, editId) {
+  const editing = editId ? state.reports.find(r => r.id === editId) : null;
+  if (editing) {
+    fid = editing.fieldId;
+    state.currentReport = { editId: editId, photos: (editing.photos || []).map(p => ({...p})) };
+  } else {
+    state.currentReport = { photos: [] };
+  }
   const fieldOpts = state.fields.map(f => `<option value="${f.id}" ${fid===f.id?'selected':''}>${esc(f.name)} — ${esc(f.grower)}</option>`).join('');
   const today = new Date().toISOString().slice(0, 10);
   openModal(`
     <div class="modal-head">
-      <div><div class="modal-title">New Scouting Report</div><div class="modal-sub">Complete each section that applies</div></div>
+      <div><div class="modal-title">${editing ? 'Edit Scouting Report' : 'New Scouting Report'}</div><div class="modal-sub">${editing ? 'Editing report from ' + esc(editing.date || '') : 'Complete each section that applies'}</div></div>
       <button class="modal-close" onclick="closeModal()">×</button>
     </div>
     <div class="modal-body">
@@ -3751,7 +3863,46 @@ function openNewReport(fid) {
       <button class="btn btn-primary" onclick="saveReport()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Save Report</button>
     </div>
   `);
-  state.currentReport = { photos: [] };
+  // Prefill fields if editing
+  if (editing) {
+    const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val ?? ''; };
+    set('rDate', editing.date);
+    set('rScout', editing.scout);
+    set('rStage', editing.growthStage);
+    set('rWeather', editing.weather);
+    set('rStandPop', editing.stand?.population);
+    set('rStandUnif', editing.stand?.uniformity);
+    set('rStandRoot', editing.stand?.rootHealth);
+    set('rStandEmerge', editing.stand?.emergence);
+    set('rWeedSpecies', editing.weeds?.species);
+    set('rWeedDensity', editing.weeds?.density);
+    set('rWeedStage', editing.weeds?.stage);
+    set('rWeedSev', editing.weeds?.severity);
+    set('rWeedResist', editing.weeds?.resistant);
+    set('rInsPest', editing.insects?.pest);
+    set('rInsCount', editing.insects?.count);
+    set('rInsThresh', editing.insects?.threshold);
+    set('rInsNotes', editing.insects?.notes);
+    set('rDisName', editing.disease?.identified);
+    set('rDisSev', editing.disease?.severity);
+    set('rDisLoc', editing.disease?.location);
+    set('rDisRisk', editing.disease?.risk);
+    set('rNutDef', editing.nutrient?.deficiency);
+    set('rNutComp', editing.nutrient?.compaction);
+    set('rNutMoist', editing.nutrient?.moisture);
+    set('rNutEnv', editing.nutrient?.envStress);
+    set('rCondPond', editing.conditions?.ponding);
+    set('rCondEros', editing.conditions?.erosion);
+    set('rCondStorm', editing.conditions?.storm);
+    set('rCondTile', editing.conditions?.tile);
+    set('rRecProd', editing.recs?.product);
+    set('rRecTiming', editing.recs?.timing);
+    set('rRecRescout', editing.recs?.rescout);
+    set('rRecPriority', editing.recs?.priority);
+    set('rHealth', editing.healthScore);
+    set('rRecAction', editing.recs?.action);
+    renderPhotoGrid();
+  }
 }
 
 function section(title, color, body) {
@@ -3770,13 +3921,18 @@ function handlePhotoUpload(e) {
   files.forEach(file => {
     compressImage(file, 1600, 0.75).then(async dataUrl => {
       const photoId = uid('p');
-      // Push placeholder immediately so UI shows it
+      // Push placeholder with base64 preview so the grid shows it immediately.
+      // Once upload completes, we swap p.data to the Storage download URL.
       state.currentReport.photos.push({ id: photoId, data: dataUrl, caption: '', name: file.name, uploading: true });
       renderPhotoGrid();
       try {
-        await photoStore.savePhoto(photoId, dataUrl);
+        const url = await photoStore.savePhoto(photoId, dataUrl);
         const ph = state.currentReport.photos.find(p => p.id === photoId);
-        if (ph) { ph.uploading = false; renderPhotoGrid(); }
+        if (ph) {
+          ph.data = url;          // swap preview base64 for the permanent URL
+          ph.uploading = false;
+          renderPhotoGrid();
+        }
       } catch (err) {
         console.error('Photo upload failed:', err);
         toast('Photo upload failed: ' + (file.name || 'unknown'));
@@ -3845,8 +4001,9 @@ function saveReport() {
   if (!f) { toast('Select a field'); return; }
   const get = id => (document.getElementById(id) || {}).value || '';
   const priority = get('rRecPriority');
+  const editId = state.currentReport?.editId;
   const report = {
-    id: uid('r'),
+    id: editId || uid('r'),
     fieldId: fid,
     fieldName: f.name,
     date: get('rDate'),
@@ -3860,34 +4017,40 @@ function saveReport() {
     nutrient: { deficiency: get('rNutDef'), compaction: get('rNutComp'), moisture: get('rNutMoist'), envStress: get('rNutEnv') },
     conditions: { ponding: get('rCondPond'), erosion: get('rCondEros'), storm: get('rCondStorm'), tile: get('rCondTile') },
     recs: { product: get('rRecProd'), timing: get('rRecTiming'), rescout: get('rRecRescout'), priority: priority, action: get('rRecAction') },
-    photos: state.currentReport.photos.map(p => ({ id: p.id, caption: p.caption, name: p.name })),
+    photos: state.currentReport.photos.map(p => ({ id: p.id, caption: p.caption, name: p.name, data: p.data })),
     healthScore: parseInt(get('rHealth')) || 80,
   };
-  state.reports.push(report);
+  if (editId) {
+    const idx = state.reports.findIndex(r => r.id === editId);
+    if (idx >= 0) state.reports[idx] = report;
+    else state.reports.push(report);
+  } else {
+    state.reports.push(report);
+  }
   // Update field status from priority/severity
   if (priority === 'Urgent' || priority === 'High') state.fieldStatuses[fid] = 'action';
   else if (priority === 'Medium') state.fieldStatuses[fid] = 'watch';
   state.currentReport = null;
   closeModal();
-  toast('Report saved');
+  toast(editId ? 'Report updated' : 'Report saved');
   render();
 }
 
 function openReportView(rid) {
   const r = state.reports.find(x => x.id === rid);
   if (!r) return;
-  // Hydrate photo data from photo store if missing (one-time, no loop)
+  // Hydrate photo URLs from Storage if missing (legacy reports + first-time-on-new-device).
+  // After hydration, p.data holds an https:// download URL — small and safe to live in state.
   if (r.photos && r.photos.length > 0 && !r._photosHydrated) {
     r._photosHydrated = true;
     let needsRehydrate = false;
     Promise.all(r.photos.map(async p => {
-      if (!p.data) {
-        needsRehydrate = true;
-        const data = photoStore.getCached(p.id) || await photoStore.loadPhoto(p.id);
-        if (data) p.data = data;
-      }
+      // Skip if we already have a valid URL
+      if (typeof p.data === 'string' && p.data.startsWith('http')) return;
+      needsRehydrate = true;
+      const url = photoStore.getCached(p.id) || await photoStore.loadPhoto(p.id);
+      if (url) p.data = url;
     })).then(() => {
-      // Only re-render if we actually loaded something new and modal is still open
       if (needsRehydrate) {
         const modal = document.getElementById('modal');
         if (modal && modal.classList.contains('show')) openReportView(rid);
@@ -4008,6 +4171,7 @@ function openReportView(rid) {
       <button class="btn btn-ghost" onclick="closeModal()">Close</button>
       <button class="btn btn-rust" onclick="deleteReport('${r.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg> Delete</button>
       <button class="btn btn-ghost" onclick="exportReportHTML('${r.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> HTML</button>
+      <button class="btn btn-ghost" onclick="closeModal(); openNewReport(null, '${r.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Edit</button>
       <button class="btn btn-primary" onclick="exportReportPDF('${r.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> Export PDF</button>
     </div>
   `);
