@@ -3727,11 +3727,43 @@ function section(title, color, body) {
 function handlePhotoUpload(e) {
   const files = Array.from(e.target.files);
   files.forEach(file => {
+    compressImage(file, 1600, 0.75).then(dataUrl => {
+      state.currentReport.photos.push({ id: uid('p'), data: dataUrl, caption: '', name: file.name });
+      renderPhotoGrid();
+    }).catch(err => {
+      console.error('Photo compression failed:', err);
+      toast('Could not process photo: ' + (file.name || 'unknown'));
+    });
+  });
+  // Clear the input so the same file can be re-picked if needed
+  e.target.value = '';
+}
+
+function compressImage(file, maxDim, quality) {
+  return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = ev => {
-      state.currentReport.photos.push({ id: uid('p'), data: ev.target.result, caption: '', name: file.name });
-      renderPhotoGrid();
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > height && width > maxDim) {
+          height = Math.round(height * (maxDim / width));
+          width = maxDim;
+        } else if (height > maxDim) {
+          width = Math.round(width * (maxDim / height));
+          height = maxDim;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = reject;
+      img.src = ev.target.result;
     };
+    reader.onerror = reject;
     reader.readAsDataURL(file);
   });
 }
@@ -3953,24 +3985,34 @@ function exportReportPDF(rid) {
   });
 }
 
-function exportReportHTML(rid) {
+function exportReportPDF(rid) {
   const r = state.reports.find(x => x.id === rid);
   if (!r) return;
   const el = document.getElementById('reportPrintable');
   if (!el) return;
-  const styles = Array.from(document.styleSheets).map(ss => {
-    try { return Array.from(ss.cssRules).map(rule => rule.cssText).join('\n'); }
-    catch (e) { return ''; }
-  }).join('\n');
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>FieldScout Report - ${esc(r.fieldName)}</title><style>${styles}\nbody{background:#f7f4ee;font-family:Inter,sans-serif;padding:20px}</style></head><body>${el.outerHTML}</body></html>`;
-  const blob = new Blob([html], { type: 'text/html' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `FieldScout_${r.fieldName.replace(/[^a-z0-9]/gi, '_')}_${r.date}.html`;
-  a.click();
-  URL.revokeObjectURL(url);
-  toast('HTML downloaded');
+  toast('Generating PDF…');
+  const { jsPDF } = window.jspdf;
+  html2canvas(el, { scale: 2, backgroundColor: '#ffffff', useCORS: true }).then(canvas => {
+    const imgData = canvas.toDataURL('image/png');
+    const pdf = new jsPDF('p', 'mm', 'letter');
+    const pdfW = pdf.internal.pageSize.getWidth();
+    const pdfH = pdf.internal.pageSize.getHeight();
+    const margin = 10;
+    const maxW = pdfW - margin * 2;
+    const maxH = pdfH - margin * 2;
+    // Scale to fit on ONE page — pick the smaller ratio so nothing overflows
+    const ratio = Math.min(maxW / canvas.width, maxH / canvas.height);
+    const imgW = canvas.width * ratio;
+    const imgH = canvas.height * ratio;
+    const xOffset = (pdfW - imgW) / 2;
+    pdf.addImage(imgData, 'PNG', xOffset, margin, imgW, imgH);
+    const fname = `FieldScout_${r.fieldName.replace(/[^a-z0-9]/gi, '_')}_${r.date}.pdf`;
+    pdf.save(fname);
+    toast('PDF downloaded');
+  }).catch(err => {
+    console.error(err);
+    toast('PDF generation failed');
+  });
 }
 
 /* ============ FILE IMPORT ============ */
