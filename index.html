@@ -3566,7 +3566,7 @@ function openNewField() {
         <div class="form-field span-2"><label>Field Name</label><input type="text" id="nfName" placeholder="e.g. North 80"/></div>
         <div class="form-field"><label>Acres</label><input type="number" step="0.1" id="nfAcres" placeholder="0.0"/></div>
         <div class="form-field"><label>Crop</label><select id="nfCrop"><option>Corn</option><option>Soybeans</option><option>Wheat</option><option>Other</option></select></div>
-        <div class="form-field"><label>Hybrid / Variety</label><input type="text" id="nfHybrid" placeholder="e.g. DKC114-99VT4P"/></div>
+        <div class="form-field"><label>Hybrid / Variety</label><select id="nfHybrid"><option value="">— Select a hybrid —</option>${state.hybrids.filter(h => h.name && !h.name.startsWith('__NEW_HYBRID_')).slice().sort((a,b) => (a.name||'').localeCompare(b.name||'')).map(h => `<option value="${esc(h.name)}">${esc(h.name)}${h.rm ? ' · RM ' + esc(h.rm) : ''}</option>`).join('')}</select></div>
         <div class="form-field"><label>Planting Date</label><input type="date" id="nfDate"/></div>
         <div class="form-field"><label>Previous Crop</label><input type="text" id="nfPrev" placeholder="Soybeans"/></div>
         <div class="form-field"><label>Population Target</label><input type="number" id="nfPop" placeholder="30000"/></div>
