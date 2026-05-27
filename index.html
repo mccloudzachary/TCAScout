@@ -4320,7 +4320,7 @@ function openReportView(rid) {
           <div class="report-section">
             <div class="report-section-title">Photos (${r.photos.length})</div>
             <div class="report-photos">
-              ${r.photos.map(p => `<div class="report-photo"><img src="${p.data || ''}" alt=""/>${p.caption ? `<div class="rp-caption">${esc(p.caption)}</div>` : ''}</div>`).join('')}
+              ${r.photos.map(p => `<div class="report-photo"><img src="${p.data || ''}" alt="" crossorigin="anonymous"/>${p.caption ? `<div class="rp-caption">${esc(p.caption)}</div>` : ''}</div>`).join('')}
             </div>
           </div>
         ` : ''}
@@ -4356,37 +4356,24 @@ function reportSectionView(title, items) {
 }
 
 /* ============ EXPORTS ============ */
-function exportReportPDF(rid) {
-  const r = state.reports.find(x => x.id === rid);
-  if (!r) return;
-  const el = document.getElementById('reportPrintable');
-  if (!el) return;
-  toast('Generating PDF…');
-  const { jsPDF } = window.jspdf;
-  html2canvas(el, { scale: 2, backgroundColor: '#ffffff', useCORS: true }).then(canvas => {
-    const imgData = canvas.toDataURL('image/png');
-    const pdf = new jsPDF('p', 'mm', 'letter');
-    const pdfW = pdf.internal.pageSize.getWidth();
-    const pdfH = pdf.internal.pageSize.getHeight();
-    const imgW = pdfW - 20;
-    const imgH = (canvas.height * imgW) / canvas.width;
-    let heightLeft = imgH;
-    let position = 10;
-    pdf.addImage(imgData, 'PNG', 10, position, imgW, imgH);
-    heightLeft -= (pdfH - 20);
-    while (heightLeft > 0) {
-      position = heightLeft - imgH + 10;
-      pdf.addPage();
-      pdf.addImage(imgData, 'PNG', 10, position, imgW, imgH);
-      heightLeft -= (pdfH - 20);
-    }
-    const fname = `FieldScout_${r.fieldName.replace(/[^a-z0-9]/gi, '_')}_${r.date}.pdf`;
-    pdf.save(fname);
-    toast('PDF downloaded');
-  }).catch(err => {
-    console.error(err);
-    toast('PDF generation failed');
-  });
+// Wait for every <img> inside an element to finish loading.
+// Re-sets src with crossorigin to force a CORS-clean fetch (browsers cache
+// the first request's CORS mode, so an image already loaded without CORS
+// would still taint the canvas otherwise).
+function waitForImages(container) {
+  const imgs = Array.from(container.querySelectorAll('img'));
+  return Promise.all(imgs.map(img => new Promise(resolve => {
+    if (!img.src) return resolve();
+    const original = img.src;
+    img.crossOrigin = 'anonymous';
+    // Force reload through CORS-aware fetch
+    img.src = '';
+    img.onload = () => resolve();
+    img.onerror = () => { console.warn('Image failed to load for PDF:', original); resolve(); };
+    img.src = original;
+    // Safety timeout — never block PDF generation longer than 8s per image
+    setTimeout(resolve, 8000);
+  })));
 }
 
 function exportReportPDF(rid) {
@@ -4396,20 +4383,58 @@ function exportReportPDF(rid) {
   if (!el) return;
   toast('Generating PDF…');
   const { jsPDF } = window.jspdf;
-  html2canvas(el, { scale: 2, backgroundColor: '#ffffff', useCORS: true }).then(canvas => {
-    const imgData = canvas.toDataURL('image/png');
+  waitForImages(el).then(() => {
+    return html2canvas(el, { scale: 2, backgroundColor: '#ffffff', useCORS: true, allowTaint: false });
+  }).then(canvas => {
     const pdf = new jsPDF('p', 'mm', 'letter');
     const pdfW = pdf.internal.pageSize.getWidth();
     const pdfH = pdf.internal.pageSize.getHeight();
     const margin = 10;
-    const maxW = pdfW - margin * 2;
-    const maxH = pdfH - margin * 2;
-    // Scale to fit on ONE page — pick the smaller ratio so nothing overflows
-    const ratio = Math.min(maxW / canvas.width, maxH / canvas.height);
-    const imgW = canvas.width * ratio;
-    const imgH = canvas.height * ratio;
-    const xOffset = (pdfW - imgW) / 2;
-    pdf.addImage(imgData, 'PNG', xOffset, margin, imgW, imgH);
+    const contentW = pdfW - margin * 2;
+    const contentH = pdfH - margin * 2;
+    const pxPerPage = Math.floor((canvas.width * contentH) / contentW);
+
+    // Find smart break points: top edge of every .report-section relative to the canvas
+    // We scaled by 2 in html2canvas, so multiply DOM offsets by 2 to match canvas pixels
+    const SCALE = 2;
+    const elTop = el.getBoundingClientRect().top;
+    const breakable = Array.from(el.querySelectorAll('.report-section, .report-footer'));
+    const breakPoints = breakable.map(node => {
+      return Math.round((node.getBoundingClientRect().top - elTop) * SCALE);
+    }).filter(p => p > 0);
+
+    let yOffset = 0;
+    let pageNum = 0;
+    while (yOffset < canvas.height) {
+      let sliceH = Math.min(pxPerPage, canvas.height - yOffset);
+      // If this isn't the last slice, snap to the nearest section break above the cut
+      if (yOffset + sliceH < canvas.height) {
+        const idealEnd = yOffset + sliceH;
+        // Find the largest break point that's <= idealEnd and > yOffset
+        let snap = 0;
+        for (const bp of breakPoints) {
+          if (bp > yOffset && bp <= idealEnd) snap = bp;
+        }
+        // Only snap if we found a reasonable break (not tiny — at least 40% of a page)
+        if (snap > yOffset + pxPerPage * 0.4) {
+          sliceH = snap - yOffset;
+        }
+      }
+      const slice = document.createElement('canvas');
+      slice.width = canvas.width;
+      slice.height = sliceH;
+      slice.getContext('2d').drawImage(
+        canvas,
+        0, yOffset, canvas.width, sliceH,
+        0, 0, canvas.width, sliceH
+      );
+      const sliceImg = slice.toDataURL('image/jpeg', 0.92);
+      const sliceRenderH = (sliceH * contentW) / canvas.width;
+      if (pageNum > 0) pdf.addPage();
+      pdf.addImage(sliceImg, 'JPEG', margin, margin, contentW, sliceRenderH);
+      yOffset += sliceH;
+      pageNum++;
+    }
     const fname = `FieldScout_${r.fieldName.replace(/[^a-z0-9]/gi, '_')}_${r.date}.pdf`;
     pdf.save(fname);
     toast('PDF downloaded');
