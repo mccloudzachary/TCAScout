@@ -1492,6 +1492,12 @@ function esc(s) {
 
 function fmtDate(d) {
   if (!d) return '—';
+  // If it's a YYYY-MM-DD string, parse as local time to avoid UTC->local day shift
+  if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d)) {
+    const [y, m, day] = d.split('-').map(Number);
+    const dt = new Date(y, m - 1, day);
+    return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
   const dt = new Date(d);
   if (isNaN(dt)) return d;
   return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
@@ -3082,6 +3088,7 @@ function openFieldDetail(fid) {
     </div>
     <div class="modal-foot">
       <button class="btn btn-ghost" onclick="closeModal()">Close</button>
+      <button class="btn btn-ghost" onclick="openEditField('${f.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Edit Field</button>
       <button class="btn btn-rust" onclick="deleteField('${f.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/></svg> Delete Field</button>
       <button class="btn btn-primary" onclick="closeModal(); openNewReport('${f.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Scouting Report</button>
     </div>
@@ -3721,7 +3728,99 @@ function saveNewField() {
   toast('Field added');
   render();
 }
+function openEditField(fid) {
+  const f = state.fields.find(x => x.id === fid);
+  if (!f) return;
+  const growerOpts = state.growers.map(g => `<option value="${esc(g.name)}" ${g.name===f.grower?'selected':''}>${esc(g.name)}</option>`).join('');
+  const cropOpts = ['Corn','Soybeans','Wheat','Other'].map(c => `<option ${c===f.crop?'selected':''}>${c}</option>`).join('');
+  const hybridOpts = `<option value="">— Select a hybrid —</option>` + state.hybrids.filter(h => h.name && !h.name.startsWith('__NEW_HYBRID_')).slice().sort((a,b) => (a.name||'').localeCompare(b.name||'')).map(h => `<option value="${esc(h.name)}" ${h.name===f.hybrid?'selected':''}>${esc(h.name)}${h.rm ? ' · RM ' + esc(h.rm) : ''}</option>`).join('');
+  openModal(`
+    <div class="modal-head">
+      <div><div class="modal-title">Edit Field</div><div class="modal-sub">${esc(f.name)}</div></div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="form-field"><label>Grower</label><select id="efGrower">${growerOpts}</select></div>
+        <div class="form-field"><label>Farm</label><input type="text" id="efFarm" value="${esc(f.farm||'')}"/></div>
+        <div class="form-field span-2"><label>Field Name</label><input type="text" id="efName" value="${esc(f.name||'')}"/></div>
+        <div class="form-field"><label>Acres</label><input type="number" step="0.1" id="efAcres" value="${f.acres||0}"/></div>
+        <div class="form-field"><label>Crop</label><select id="efCrop">${cropOpts}</select></div>
+        <div class="form-field"><label>Hybrid / Variety</label><select id="efHybrid">${hybridOpts}</select></div>
+        <div class="form-field"><label>Planting Date</label><input type="date" id="efDate" value="${esc(f.plantingDate||'')}"/></div>
+        <div class="form-field"><label>Previous Crop</label><input type="text" id="efPrev" value="${esc(f.prevCrop||'')}"/></div>
+        <div class="form-field"><label>Population Target</label><input type="number" id="efPop" value="${f.population||''}"/></div>
+        <div class="form-field"><label>Row Spacing</label><input type="number" id="efSpacing" value="${f.rowSpacing||30}"/></div>
+        <div class="form-field span-2"><label>Soil Type</label><input type="text" id="efSoil" value="${esc(f.soil||'')}"/></div>
+        <div class="form-field span-2"><label>Notes</label><textarea id="efNotes" rows="2">${esc(f.notes||'')}</textarea></div>
+      </div>
+      ${f.isTrial ? '<div class="muted" style="margin-top:12px;font-size:13px;">This is a trial field with multiple hybrids. The Hybrid field above only edits the primary hybrid. Use the planting cards in the field detail view to manage individual trial varieties.</div>' : ''}
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="closeModal(); openFieldDetail('${f.id}')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveEditField('${f.id}')">Save Changes</button>
+    </div>
+  `);
+}
 
+function saveEditField(fid) {
+  const f = state.fields.find(x => x.id === fid);
+  if (!f) return;
+  const name = document.getElementById('efName').value.trim();
+  if (!name) { toast('Field name required'); return; }
+  const newHybrid = document.getElementById('efHybrid').value;
+  const newDate = document.getElementById('efDate').value;
+  const newAcres = parseFloat(document.getElementById('efAcres').value) || 0;
+  const hybridChanged = newHybrid !== f.hybrid;
+  const dateChanged = newDate !== f.plantingDate;
+
+  f.grower = document.getElementById('efGrower').value;
+  f.farm = document.getElementById('efFarm').value;
+  f.name = name;
+  f.acres = newAcres;
+  f.crop = document.getElementById('efCrop').value;
+  f.hybrid = newHybrid;
+  f.plantingDate = newDate;
+  f.prevCrop = document.getElementById('efPrev').value;
+  f.population = parseInt(document.getElementById('efPop').value) || 0;
+  f.rowSpacing = parseInt(document.getElementById('efSpacing').value) || 30;
+  f.soil = document.getElementById('efSoil').value;
+  f.notes = document.getElementById('efNotes').value;
+
+  // Sync the primary planting (non-trial fields, or first planting of trial)
+  // so the planting card reflects the new hybrid/date.
+  if (!f.isTrial) {
+    if (newHybrid) {
+      if (!f.plantings || f.plantings.length === 0) {
+        f.plantings = [{
+          hybridRaw: newHybrid,
+          matchedHybrid: newHybrid,
+          matchStatus: 'exact',
+          acres: newAcres,
+          planted: newDate
+        }];
+      } else {
+        const p = f.plantings[0];
+        if (hybridChanged) {
+          p.hybridRaw = newHybrid;
+          p.matchedHybrid = newHybrid;
+          p.matchStatus = 'exact';
+        }
+        if (dateChanged) p.planted = newDate;
+        p.acres = newAcres;
+      }
+    } else if (f.plantings && f.plantings.length > 0) {
+      // Hybrid cleared — leave plantings alone but null the matched name
+      f.plantings[0].hybridRaw = '';
+      f.plantings[0].matchedHybrid = null;
+    }
+  }
+
+  closeModal();
+  toast('Field updated');
+  render();
+  openFieldDetail(fid);
+}
 function openNewGrower() {
   openModal(`
     <div class="modal-head">
