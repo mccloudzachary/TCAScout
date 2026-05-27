@@ -3690,20 +3690,30 @@ function openNewField() {
 function saveNewField() {
   const name = document.getElementById('nfName').value.trim();
   if (!name) { toast('Field name required'); return; }
+  const hybridName = document.getElementById('nfHybrid').value;
+  const acres = parseFloat(document.getElementById('nfAcres').value) || 0;
+  const plantingDate = document.getElementById('nfDate').value;
   const f = {
     id: uid('f'),
     grower: document.getElementById('nfGrower').value,
     farm: document.getElementById('nfFarm').value,
     name: name,
-    acres: parseFloat(document.getElementById('nfAcres').value) || 0,
+    acres: acres,
     crop: document.getElementById('nfCrop').value,
-    hybrid: document.getElementById('nfHybrid').value,
-    plantingDate: document.getElementById('nfDate').value,
+    hybrid: hybridName,
+    plantingDate: plantingDate,
     prevCrop: document.getElementById('nfPrev').value,
     population: parseInt(document.getElementById('nfPop').value) || 0,
     rowSpacing: parseInt(document.getElementById('nfSpacing').value) || 30,
     soil: document.getElementById('nfSoil').value,
     notes: document.getElementById('nfNotes').value,
+    plantings: hybridName ? [{
+      hybridRaw: hybridName,
+      matchedHybrid: hybridName,
+      matchStatus: 'exact',
+      acres: acres,
+      date: plantingDate
+    }] : []
   };
   state.fields.push(f);
   state.fieldStatuses[f.id] = 'good';
