@@ -1888,12 +1888,48 @@ function viewGrowers() {
               <div class="g-stat"><div class="g-stat-val">${state.reports.filter(r => gfields.some(f => f.id === r.fieldId)).length}</div><div class="g-stat-lbl">Reports</div></div>
             </div>
             ${g.notes ? `<div class="grower-notes">${esc(g.notes)}</div>` : ''}
-            <button class="btn btn-ghost btn-block" onclick="state.growerFilter='${esc(g.name)}'; navigate('fields')">View Fields</button>
+            <div style="display:flex; gap:8px;">
+              <button class="btn btn-ghost" style="flex:1;" onclick="state.growerFilter='${esc(g.name)}'; navigate('fields')">View Fields</button>
+              <button class="btn btn-ghost" style="padding:8px 12px;" onclick="deleteGrower('${esc(g.id)}')" title="Delete grower"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#c0392b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg></button>
+            </div>
           </div>
         `;
       }).join('')}
     </div>
   `;
+}
+function deleteGrower(growerId) {
+  const grower = state.growers.find(g => g.id === growerId);
+  if (!grower) { toast('Grower not found'); return; }
+  const gfields = state.fields.filter(f => f.grower === grower.name);
+
+  let confirmMsg;
+  if (gfields.length === 0) {
+    confirmMsg = `Delete grower "${grower.name}"? They have no fields.`;
+  } else {
+    confirmMsg = `Delete grower "${grower.name}" AND their ${gfields.length} field${gfields.length === 1 ? '' : 's'} (${gfields.reduce((s,f) => s+f.acres, 0).toFixed(0)} acres)?\n\nThis will also remove all reports, photos, boundaries, and statuses tied to those fields. This cannot be undone.`;
+  }
+  if (!confirm(confirmMsg)) return;
+
+  // Remove fields + all field-scoped data
+  const fieldIds = new Set(gfields.map(f => f.id));
+  state.fields = state.fields.filter(f => !fieldIds.has(f.id));
+  state.reports = state.reports.filter(r => !fieldIds.has(r.fieldId));
+  fieldIds.forEach(fid => {
+    delete state.fieldStatuses[fid];
+    delete state.fieldBoundaries[fid];
+    if (state.photos) delete state.photos[fid];
+    if (state.hybridOverrides) delete state.hybridOverrides[fid];
+  });
+
+  // Remove the grower
+  state.growers = state.growers.filter(g => g.id !== growerId);
+
+  // Clear grower filter if it pointed at the deleted one
+  if (state.growerFilter === grower.name) state.growerFilter = 'all';
+
+  toast(`Deleted ${grower.name}${gfields.length ? ` + ${gfields.length} field${gfields.length === 1 ? '' : 's'}` : ''}`);
+  render();
 }
 
 function viewFields() {
@@ -2620,6 +2656,24 @@ function viewImport() {
           <div class="import-stats">
             <div><strong>${state.hybrids.length}</strong> hybrids in library</div>
             <div><strong>${[...new Set(state.hybrids.map(h => h.source || 'Other'))].join(', ')}</strong></div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title">Field Boundaries</div>
+        </div>
+        <div class="panel-body">
+          <p class="import-desc">Upload zipped shapefile (.zip) or GeoJSON with field boundaries. After upload, you'll be asked which grower to assign new fields to. Sources: Climate FieldView, John Deere Ops Center, Granular, FarmRTX.</p>
+          <div class="dropzone" id="dz3">
+            <input type="file" id="boundaryFileImport" accept=".zip,.shp,.kml,.kmz,.geojson,.json" hidden onchange="handleBoundaryFileFromImport(event)"/>
+            <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+            <div class="dz-title">Drop boundary file or <span class="dz-link">browse</span></div>
+            <div class="dz-sub">.zip (shapefile), .geojson, .json</div>
+          </div>
+          <div class="import-stats">
+            <div><strong>${Object.keys(state.fieldBoundaries).length}</strong> fields mapped</div>
+            <div><strong>${state.fields.length - Object.keys(state.fieldBoundaries).length}</strong> unmapped</div>
           </div>
         </div>
       </div>
@@ -4703,6 +4757,7 @@ function attachListeners() {
   // Dropzones
   setupDropzone('dz1', 'plantingFile', handlePlantingFile);
   setupDropzone('dz2', 'seedFile', handleSeedFile);
+  setupDropzone('dz3', 'boundaryFileImport', handleBoundaryFileFromImportFile);
 }
 
 function setupDropzone(zoneId, inputId, handler) {
@@ -4861,7 +4916,204 @@ function processGeoJsonBoundaries(gj) {
   render();
 }
 
+// ===== NEW CODE STARTS HERE =====
+
+// Entry point from the Import tab dropzone (input change event)
+function handleBoundaryFileFromImport(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  handleBoundaryFileFromImportFile(file);
+  e.target.value = '';
+}
+
+// Entry point from the Import tab dropzone (drag/drop or click — file object directly)
+// Reads the file first, then opens a modal to pick the grower before importing.
+function handleBoundaryFileFromImportFile(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  toast('Reading boundaries…');
+  const reader = new FileReader();
+  reader.onload = async ev => {
+    try {
+      let geojson;
+      if (ext === 'zip' || ext === 'shp') {
+        if (!window.shp) throw new Error('Shapefile library not loaded');
+        geojson = await window.shp(ev.target.result);
+      } else if (ext === 'geojson' || ext === 'json') {
+        const text = typeof ev.target.result === 'string' ? ev.target.result : new TextDecoder().decode(ev.target.result);
+        geojson = JSON.parse(text);
+      } else {
+        throw new Error('Unsupported file type: ' + ext);
+      }
+      // Count features so the modal can tell the user what they're about to import
+      const collections = Array.isArray(geojson) ? geojson : [geojson];
+      let featureCount = 0;
+      collections.forEach(fc => { if (fc && fc.features) featureCount += fc.features.length; });
+      if (featureCount === 0) { toast('No polygon features found in file'); return; }
+      // Stash the parsed geojson + filename on state so the modal callback can use it
+      state._pendingBoundaryImport = { geojson, filename: file.name, count: featureCount };
+      openBoundaryGrowerPicker();
+    } catch (err) {
+      console.error(err);
+      toast('Boundary import failed: ' + err.message);
+    }
+  };
+  if (ext === 'geojson' || ext === 'json') reader.readAsText(file);
+  else reader.readAsArrayBuffer(file);
+}
+
+// Modal: asks which grower the imported boundaries belong to.
+// Shows count of fields found + filename, lets user pick existing grower OR type new name.
+function openBoundaryGrowerPicker() {
+  const pending = state._pendingBoundaryImport;
+  if (!pending) return;
+  const suggestedName = pending.filename.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim() || 'Imported Grower';
+  const growerOpts = state.growers
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map(g => `<option value="${esc(g.name)}">${esc(g.name)}</option>`)
+    .join('');
+  openModal(`
+    <div class="modal-head">
+      <div>
+        <div class="modal-title">Assign Boundaries to Grower</div>
+        <div class="modal-sub">${pending.count} field boundaries found in <strong>${esc(pending.filename)}</strong></div>
+      </div>
+      <button class="modal-close" onclick="cancelBoundaryImport()">×</button>
+    </div>
+    <div class="modal-body">
+      <div style="margin-bottom:16px;">
+        <label style="font-size:13px; font-weight:600; color:var(--navy); display:block; margin-bottom:8px;">Pick an existing grower</label>
+        <select id="bgpExisting" class="filter-select" style="width:100%;" onchange="document.getElementById('bgpNew').value=''">
+          <option value="">— Choose grower —</option>
+          ${growerOpts}
+        </select>
+      </div>
+      <div style="text-align:center; color:var(--muted); font-size:12px; margin:14px 0;">— or —</div>
+      <div>
+        <label style="font-size:13px; font-weight:600; color:var(--navy); display:block; margin-bottom:8px;">Create a new grower</label>
+        <input type="text" id="bgpNew" class="filter-select" style="width:100%;" placeholder="Grower name" value="${esc(suggestedName)}" oninput="document.getElementById('bgpExisting').value=''"/>
+        <div class="muted" style="font-size:12px; margin-top:6px;">Suggested from filename. Edit if you'd like a different name.</div>
+      </div>
+      <div class="muted" style="font-size:12px; margin-top:18px; padding:10px; background:var(--cream); border-radius:8px;">
+        Boundaries that match existing field names (≥85% similarity) will link to those fields. The rest will create new fields under the grower you pick.
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-ghost" onclick="cancelBoundaryImport()">Cancel</button>
+      <button class="btn btn-primary" onclick="confirmBoundaryImport()">Import ${pending.count} Boundaries</button>
+    </div>
+  `);
+}
+
+function cancelBoundaryImport() {
+  state._pendingBoundaryImport = null;
+  closeModal();
+  toast('Boundary import cancelled');
+}
+
+function confirmBoundaryImport() {
+  const pending = state._pendingBoundaryImport;
+  if (!pending) { closeModal(); return; }
+  const existing = document.getElementById('bgpExisting').value;
+  const newName = document.getElementById('bgpNew').value.trim();
+  const targetGrower = existing || newName;
+  if (!targetGrower) { toast('Pick a grower or type a name'); return; }
+  closeModal();
+  processBoundariesWithGrower(pending.geojson, targetGrower);
+  state._pendingBoundaryImport = null;
+}
+
+// Like processGeoJsonBoundaries, but creates fields + growers for unmatched boundaries
+// instead of dropping them into the pending-review queue.
+function processBoundariesWithGrower(gj, growerName) {
+  const collections = Array.isArray(gj) ? gj : [gj];
+  let total = 0, linkedExisting = 0, createdFields = 0, createdGrower = false;
+
+  // Auto-create grower if it doesn't exist
+  if (!state.growers.find(g => g.name === growerName)) {
+    state.growers.push({ id: uid('g'), name: growerName, farms: ['Imported'], contact: '', notes: 'Created from boundary import.' });
+    createdGrower = true;
+  }
+
+  collections.forEach(fc => {
+    if (!fc || !fc.features) return;
+    fc.features.forEach(feat => {
+      const coords = extractPolygonCoords(feat.geometry);
+      if (!coords || coords.length < 3) return;
+      const props = feat.properties || {};
+      const sourceName = props.Name || props.name || props.NAME || props.FIELD || props.field
+        || props.Field_Name || props.field_name || props.FIELDNAME || props.Label
+        || props.label || '(unnamed)';
+      // Try to compute acres from the polygon if not present in properties
+      const propAcres = parseFloat(props.Acres || props.ACRES || props.acres || props.Area_Ac || 0);
+      total++;
+
+      // First, try to match an existing field
+      const match = findBestFieldMatch(sourceName);
+      if (match && match.score >= 0.85) {
+        state.fieldBoundaries[match.field.id] = { coords, sourceName, score: match.score };
+        linkedExisting++;
+        return;
+      }
+
+      // No match — create a new field under the target grower
+      const newField = {
+        id: uid('f'),
+        grower: growerName,
+        farm: String(props.Farm || props.FARM || 'Imported'),
+        name: sourceName,
+        acres: propAcres || computeAcresFromCoords(coords),
+        crop: 'Corn',
+        hybrid: '',
+        plantingDate: '',
+        prevCrop: '',
+        population: 0,
+        rowSpacing: 30,
+        soil: '',
+        notes: 'Created from boundary import.',
+      };
+      state.fields.push(newField);
+      state.fieldStatuses[newField.id] = 'good';
+      state.fieldBoundaries[newField.id] = { coords, sourceName, score: 1 };
+      createdFields++;
+    });
+  });
+
+  if (total === 0) { toast('No polygon features found in file'); return; }
+  const parts = [`${total} boundaries imported`];
+  if (linkedExisting) parts.push(`${linkedExisting} linked to existing fields`);
+  if (createdFields) parts.push(`${createdFields} new fields created`);
+  if (createdGrower) parts.push(`grower "${growerName}" created`);
+  toast(parts.join(' · '));
+  render();
+}
+
+// Rough acres calculation from lat/lng polygon using the shoelace formula.
+// Good enough for display — uses an equirectangular projection scaled to the
+// polygon's latitude. Accuracy degrades for huge polygons or extreme latitudes,
+// but typical fields are <1000ac so error stays well under 1%.
+function computeAcresFromCoords(coords) {
+  if (!coords || coords.length < 3) return 0;
+  const R = 6378137; // earth radius meters
+  const latRad = coords[0][0] * Math.PI / 180;
+  const mPerDegLat = 111320;
+  const mPerDegLng = 111320 * Math.cos(latRad);
+  let area = 0;
+  for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
+    const xi = coords[i][1] * mPerDegLng;
+    const yi = coords[i][0] * mPerDegLat;
+    const xj = coords[j][1] * mPerDegLng;
+    const yj = coords[j][0] * mPerDegLat;
+    area += (xj + xi) * (yj - yi);
+  }
+  area = Math.abs(area) / 2; // square meters
+  return area / 4046.8564224; // → acres
+}
+
+// ===== NEW CODE ENDS HERE =====
+
 // Extract first ring of polygon coordinates from a geometry, converted to [lat, lng] for Leaflet
+
 function extractPolygonCoords(geom) {
   if (!geom) return null;
   let ring;
